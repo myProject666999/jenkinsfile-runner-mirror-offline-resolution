@@ -69,7 +69,7 @@ THE SOFTWARE.
     <maven.compiler.release>21</maven.compiler.release>
     <jenkins.version>2.555.3</jenkins.version>
     <jenkins.bom.baseline>bom-2.555.x</jenkins.bom.baseline>
-    <jenkins.bom.version>6641.vfe1b_b_3c48a_4a_</jenkins.bom.version>
+    <jenkins.bom.version>7401.vf0f166b_7fd69</jenkins.bom.version>
     <!-- Jenkins core 2.555.x brings spotbugs-annotations 4.9.8 transitively;
          the runner parent 1.140 still ships 4.9.4. Match core to satisfy
          RequireUpperBoundDeps. -->
