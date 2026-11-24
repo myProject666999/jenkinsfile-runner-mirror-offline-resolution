@@ -75,7 +75,7 @@ THE SOFTWARE.
          RequireUpperBoundDeps. -->
     <spotbugs-annotations.version>4.9.8</spotbugs-annotations.version>
     <jetty.version>12.0.27</jetty.version>
-    <jenkins-test-harness.version>2573.vd91b_8a_43e019</jenkins-test-harness.version>
+    <jenkins-test-harness.version>2589.v1b_b_c221c5335</jenkins-test-harness.version>
     <!--TODO: Reenable once all the issues are fixed (JENKINS-57353)-->
     <spotbugs.failOnError>false</spotbugs.failOnError>
   </properties>
