@@ -34,8 +34,23 @@ public class JenkinsLauncherOptions {
     public String version;
 
     @CommandLine.Option(names = { "-m", "--mirror"},
-            description = "Download mirror site of Jenkins, defaults to http://updates.jenkins.io/download. Get the mirror list from http://mirrors.jenkins-ci.org/status.html")
+            description = "Base URL used to download the Jenkins WAR and plugins when they are not cached. " +
+                    "The trailing slash is optional. Supported schemes: http, https, file. " +
+                    "It does not affect stable/latestCore.txt; use --mirrorCore for that. " +
+                    "Get the mirror list from http://mirrors.jenkins-ci.org/status.html")
     public String mirror;
+
+    @CommandLine.Option(names = "--mirrorCore",
+            description = "Base URL used to download stable/latestCore.txt (the latest LTS version number). " +
+                    "Defaults to http://updates.jenkins.io. Only set this when the mirror serves the same 'stable' path.")
+    public String mirrorCore;
+
+    @CommandLine.Option(names = "--offline",
+            description = "Never use the network. All required artifacts must already be present in the cache; " +
+                    "if any are missing, they are all reported before anything is installed and the run fails. " +
+                    "Without --jenkins-version the cached war/latest.txt is used regardless of its age, " +
+                    "and 'latest' plugins use the cached 'latest' entry regardless of its age.")
+    public boolean offline;
 
     /**
      * Jenkins Home for the Run.
@@ -84,12 +99,4 @@ public class JenkinsLauncherOptions {
     @CommandLine.Option(names = "--agentPort",
             description = "Port for connecting inbound Jenkins agents (over JNLP or WebSockets). Disabled by default")
     public Integer agentPort;
-    
-    public String getMirrorURL(String url) {
-        if (this.mirror == null || "".equals(this.mirror.trim())) {
-            return url;
-        }
-
-        return url.replace("https://updates.jenkins.io/download", this.mirror);
-    }
 }

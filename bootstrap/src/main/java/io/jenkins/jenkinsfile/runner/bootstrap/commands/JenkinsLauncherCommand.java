@@ -7,6 +7,14 @@ import io.jenkins.jenkinsfile.runner.bootstrap.ClassLoaderBuilder;
 import io.jenkins.jenkinsfile.runner.bootstrap.IApp;
 import io.jenkins.jenkinsfile.runner.bootstrap.SideClassLoader;
 import io.jenkins.jenkinsfile.runner.bootstrap.Util;
+import io.jenkins.jenkinsfile.runner.bootstrap.resolution.ArtifactResolver;
+import io.jenkins.jenkinsfile.runner.bootstrap.resolution.ArtifactSources;
+import io.jenkins.jenkinsfile.runner.bootstrap.resolution.CacheLayout;
+import io.jenkins.jenkinsfile.runner.bootstrap.resolution.CacheProbe;
+import io.jenkins.jenkinsfile.runner.bootstrap.resolution.DownloadRequest;
+import io.jenkins.jenkinsfile.runner.bootstrap.resolution.MissingArtifact;
+import io.jenkins.jenkinsfile.runner.bootstrap.resolution.PluginSpec;
+import io.jenkins.jenkinsfile.runner.bootstrap.resolution.ResolutionMode;
 import org.apache.commons.io.FileUtils;
 import org.apache.commons.io.FilenameUtils;
 import picocli.CommandLine;
@@ -16,16 +24,20 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.lang.reflect.InvocationTargetException;
 import java.net.HttpURLConnection;
-import java.net.URI;
 import java.net.URL;
 import java.net.URLClassLoader;
+import java.net.URLConnection;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.security.AccessController;
 import java.security.PrivilegedActionException;
 import java.security.PrivilegedExceptionAction;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.Callable;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
@@ -35,8 +47,6 @@ import static java.nio.charset.StandardCharsets.UTF_8;
  * including all required steps like Jenkins WAR and plugins resolution.
  */
 public abstract class JenkinsLauncherCommand implements Callable<Integer> {
-
-    public static final long CACHE_EXPIRE = System.currentTimeMillis() - 24 * 3600 * 1000;
 
     private static final Collection<Integer> REDIRECT_STATUSES = Arrays.asList(
         301, // Moved permanently
@@ -75,6 +85,8 @@ public abstract class JenkinsLauncherCommand implements Callable<Integer> {
      */
     private File cache = new File(System.getProperty("user.home") + "/.jenkinsfile-runner/");
 
+    private CacheLayout cacheLayout;
+
     @SuppressFBWarnings("DM_EXIT")
     public void postConstruct() throws IOException {
         final JenkinsLauncherOptions settings = getLauncherOptions();
@@ -90,16 +102,19 @@ public abstract class JenkinsLauncherCommand implements Callable<Integer> {
                     Util.getMininumJenkinsVersion());
             System.exit(-1);
         }
-        if (settings.warDir == null) {
-            // TODO: avoid modifying the option
-            settings.warDir = getJenkinsWar(settings.version);
+
+        CacheLayout layout = cacheLayout();
+        ResolutionMode mode = settings.offline ? ResolutionMode.OFFLINE : ResolutionMode.ONLINE;
+        final ArtifactSources sources;
+        try {
+            sources = ArtifactSources.from(settings.mirror, settings.mirrorCore);
+        } catch (IllegalArgumentException ex) {
+            System.err.println("Error: " + ex.getMessage());
+            System.exit(-1);
+            return;
         }
-        // Explode war if necessary
-        String warPath = settings.warDir.getAbsolutePath();
-        if(FilenameUtils.getExtension(warPath).equals("war") && new File(warPath).isFile()) {
-            System.out.println("Exploding " + warPath +  ", this might take some time.");
-            settings.warDir = Util.explodeWar(warPath);
-        }
+        ArtifactResolver resolver = new ArtifactResolver(layout, sources, CacheProbe.fileSystem(),
+                System::currentTimeMillis, mode, ArtifactResolver.DEFAULT_MAX_AGE_MILLIS);
 
         if (settings.pluginsDir == null) {
             // TODO: avoid modifying the option
@@ -109,36 +124,90 @@ public abstract class JenkinsLauncherCommand implements Callable<Integer> {
             System.exit(-1);
         }
 
+        // Parse a plugin list file up-front so offline preflight can account for every artifact.
+        List<PluginSpec> specs = null;
         if (settings.pluginsDir.isFile()) {
-            File plugins_txt = settings.pluginsDir;
+            specs = new ArrayList<>();
+            for (String line : FileUtils.readLines(settings.pluginsDir, UTF_8)) {
+                if (line.trim().isEmpty()) {
+                    continue;
+                }
+                specs.add(PluginSpec.parse(line));
+            }
+        }
+
+        if (mode == ResolutionMode.OFFLINE) {
+            preflightOffline(resolver, settings.warDir == null, settings.version,
+                    specs != null ? specs : new ArrayList<>());
+        }
+
+        if (settings.warDir == null) {
+            // TODO: avoid modifying the option
+            settings.warDir = getJenkinsWar(settings.version, resolver);
+        }
+        // Explode war if necessary
+        String warPath = settings.warDir.getAbsolutePath();
+        if(FilenameUtils.getExtension(warPath).equals("war") && new File(warPath).isFile()) {
+            System.out.println("Exploding " + warPath +  ", this might take some time.");
+            settings.warDir = Util.explodeWar(warPath);
+        }
+
+        if (specs != null) {
             // This is a plugin list file
             settings.pluginsDir = Files.createTempDirectory("plugins").toFile();
-            for (String line : FileUtils.readLines(plugins_txt, UTF_8)) {
-                String shortname = line;
-                String version = "latest";
-
-                int i = line.indexOf(':');
-                if (i != -1) {
-                    shortname = line.substring(0,i);
-                    version = line.substring(i+1);
-                }
-
-                installPlugin(settings.pluginsDir, shortname, version);
+            for (PluginSpec spec : specs) {
+                installPlugin(settings.pluginsDir, spec, resolver);
             }
         }
     }
 
-    private void copyURLToFile(URL url, File file) throws IOException {
-        HttpURLConnection connection = (HttpURLConnection) url.openConnection();
-        connection.setInstanceFollowRedirects(true);
-        int status = connection.getResponseCode();
+    /**
+     * In offline mode, reports every artifact that is required but absent from the cache in one go,
+     * before anything is installed, then exits with an input-error status.
+     */
+    @SuppressFBWarnings("DM_EXIT")
+    private void preflightOffline(ArtifactResolver resolver, boolean warRequired,
+                                  @CheckForNull String requestedWarVersion,
+                                  List<PluginSpec> specs) throws IOException {
+        String latest = null;
+        if (warRequired && requestedWarVersion == null) {
+            Path latestFile = cacheLayout().warLatestFile();
+            if (Files.isRegularFile(latestFile)) {
+                latest = FileUtils.readFileToString(latestFile.toFile(), StandardCharsets.US_ASCII).trim();
+            }
+        }
+        List<MissingArtifact> missing = resolver.missingFor(warRequired, requestedWarVersion, latest, specs);
+        if (!missing.isEmpty()) {
+            System.err.println("Error: --offline was specified but the following artifacts are not present in the cache:");
+            for (MissingArtifact artifact : missing) {
+                System.err.println("  - " + artifact.description());
+                System.err.println("      expected at: " + cacheLayout().root().resolve(artifact.cachePath()));
+            }
+            System.exit(-1);
+        }
+    }
 
-        // Connections won't automatically redirect across different protocols, i.e. going
-        // from http to https. We have to handle that ourselves.
-        if (REDIRECT_STATUSES.contains(status)) {
-            String newUrl = connection.getHeaderField("Location");
-            System.out.println("Following redirect...");
-            connection = (HttpURLConnection) new URL(newUrl).openConnection();
+    /**
+     * Opens a connection for the given address, handling cross-protocol redirects for HTTP(S) and
+     * reading {@code file:} addresses without casting. The connection is not restricted to
+     * {@link HttpURLConnection}, so {@code file:} mirrors work.
+     */
+    private void copyURLToFile(URL url, File file) throws IOException {
+        URLConnection connection = url.openConnection();
+        if (connection instanceof HttpURLConnection) {
+            HttpURLConnection http = (HttpURLConnection) connection;
+            http.setInstanceFollowRedirects(true);
+            int status = http.getResponseCode();
+
+            // Connections won't automatically redirect across different protocols, i.e. going
+            // from http to https. We have to handle that ourselves.
+            if (REDIRECT_STATUSES.contains(status)) {
+                String newUrl = http.getHeaderField("Location");
+                System.out.println("Following redirect...");
+                http = (HttpURLConnection) new URL(newUrl).openConnection();
+                http.setInstanceFollowRedirects(true);
+                connection = http;
+            }
         }
 
         try (InputStream stream = connection.getInputStream()) {
@@ -146,46 +215,65 @@ public abstract class JenkinsLauncherCommand implements Callable<Integer> {
         }
     }
 
-    private File getJenkinsWar(final @CheckForNull String requiredVersion) throws IOException {
+    private File getJenkinsWar(final @CheckForNull String requiredVersion, ArtifactResolver resolver) throws IOException {
         final String versionToUse;
         if (requiredVersion == null) {
             System.out.println("No explicit version has been selected, using latest LTS");
 
-            File latestCore = new File(cache, "war/latest.txt");
-            latestCore.getParentFile().mkdirs();
-            // Check once a day
-            if (!latestCore.exists() || latestCore.lastModified() < CACHE_EXPIRE) {
-                copyURLToFile(URI.create("http://updates.jenkins.io/stable/latestCore.txt").toURL(), latestCore);
+            Optional<DownloadRequest> refresh = resolver.latestLtsRefreshRequest();
+            if (refresh.isPresent()) {
+                cacheLayout().warLatestFile().getParent().toFile().mkdirs();
+                copyURLToFile(refresh.get().source().toURL(), refresh.get().target().toFile());
             }
-            versionToUse = FileUtils.readFileToString(latestCore, StandardCharsets.US_ASCII);
+            if (!Files.isRegularFile(cacheLayout().warLatestFile())) {
+                throw new IOException("Cannot resolve the latest LTS version: " + cacheLayout().warLatestFile() + " is missing");
+            }
+            versionToUse = FileUtils.readFileToString(cacheLayout().warLatestFile().toFile(), StandardCharsets.US_ASCII).trim();
         } else {
             versionToUse = requiredVersion;
         }
 
         System.out.printf("Running pipeline on jenkins %s%n", versionToUse);
 
-        File war = new File(cache, String.format("war/%s/jenkins-war-%s.war", versionToUse, versionToUse));
-        if (!war.exists()) {
-            war.getParentFile().mkdirs();
-            final URL url = new URL(getLauncherOptions().getMirrorURL(String.format("http://updates.jenkins.io/download/war/%s/jenkins.war", versionToUse)));
+        Optional<DownloadRequest> warDownload = resolver.warRequest(versionToUse);
+        if (warDownload.isPresent()) {
+            DownloadRequest request = warDownload.get();
+            request.target().getParent().toFile().mkdirs();
             System.out.printf("Downloading jenkins %s...%n", versionToUse);
-            copyURLToFile(url, war);
+            copyURLToFile(request.source().toURL(), request.target().toFile());
         }
 
+        File war = cacheLayout().warFile(versionToUse).toFile();
+        if (!war.isFile()) {
+            throw new IOException("Jenkins WAR is missing from the cache: " + war);
+        }
         return war;
     }
 
-    private void installPlugin(File pluginsDir, String shortname, String version) throws IOException {
-        final File install = new File(pluginsDir, shortname + ".jpi");
-        File plugin = new File(cache, String.format("plugins/%s/%s-%s.hpi", shortname, shortname, version));
-        if (!plugin.exists() || ("latest".equals(version) && plugin.lastModified() < CACHE_EXPIRE) ) {
-            plugin.getParentFile().mkdirs();
-            final URL url = new URL(getLauncherOptions().getMirrorURL(String.format("https://updates.jenkins.io/download/plugins/%s/%s/%s.hpi", shortname, version, shortname)));
-            System.out.printf("Downloading jenkins plugin %s (%s)...%n", shortname, version);
-            FileUtils.copyURLToFile(url, plugin);
+    private void installPlugin(File pluginsDir, PluginSpec spec, ArtifactResolver resolver) throws IOException {
+        final File install = new File(pluginsDir, spec.name() + ".jpi");
+
+        Optional<DownloadRequest> download = resolver.pluginRequest(spec);
+        if (download.isPresent()) {
+            DownloadRequest request = download.get();
+            request.target().getParent().toFile().mkdirs();
+            System.out.printf("Downloading jenkins plugin %s (%s)...%n", spec.name(), spec.version());
+            copyURLToFile(request.source().toURL(), request.target().toFile());
         }
 
+        File plugin = cacheLayout().pluginFile(spec.name(), spec.version()).toFile();
+        if (!plugin.isFile()) {
+            throw new IOException("Plugin artifact is missing from the cache: " + plugin);
+        }
         Files.createSymbolicLink(install.toPath(), plugin.toPath());
+    }
+
+    /** Lazily initialises the cache layout from the configured cache directory. */
+    private CacheLayout cacheLayout() {
+        if (cacheLayout == null) {
+            cacheLayout = new CacheLayout(cache.toPath());
+        }
+        return cacheLayout;
     }
 
     public ClassLoader createJenkinsWarClassLoader() throws PrivilegedActionException {

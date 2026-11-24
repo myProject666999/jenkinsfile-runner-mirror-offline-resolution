@@ -152,8 +152,23 @@ Advanced arguments:
     Path to the empty Jenkins Home directory to use for this run.
     If not specified a temporary directory will be created.
     Note that the specified folder will not be disposed after the run.
-* `--mirror` - Mirror site to be used to download plugins if `plugins.txt` is specified.
+* `--mirror` - Base URL used to download the Jenkins WAR and the plugins listed in `plugins.txt`.
+    It applies to both; this differs from earlier versions, where the mirror only affected plugins
+    because the WAR address used `http://` and was never rewritten.
+    A trailing `/` is optional and is removed; the scheme (`http`, `https`, `file`) is preserved and any
+    path prefix is kept. A `file:` mirror may point to a local directory pre-populated with the same layout,
+    which allows offline installations. Invalid mirror URLs are rejected when the arguments are parsed.
+** `--mirror` does not affect `stable/latestCore.txt`; use `--mirrorCore` to point that at a mirror that
+   serves the same `stable` path.
 ** NOTE: This option will be reworked in the future once the Plugin Installation Manager tool is integrated
+* `--mirrorCore` - Base URL used to download `stable/latestCore.txt` (the latest LTS version number).
+    Defaults to `http://updates.jenkins.io`. Only set it when the mirror serves the same `stable` path.
+* `--offline` - Never use the network. Every required artifact (the WAR, `war/latest.txt` and each plugin)
+    must already be present in the cache. Without `--jenkins-version` the cached `war/latest.txt` is used
+    regardless of its age, and `latest` plugins use the cached `latest` entry regardless of its age.
+    If anything is missing, all missing artifacts and their expected cache paths are listed before any
+    plugin is installed, and the run exits with an input error. Without `--offline` behaviour is unchanged,
+    except that the mirror now also applies to the WAR.
 * `--withInitHooks FILE` - Path to the https://www.jenkins.io/doc/book/managing/groovy-hook-scripts/[Groovy init hooks] directory
     Hooks can be also passed via `WEB-INF/groovy.init.d/**` directory within the Jenkins WAR resource loader defined in `--jenkins-war`.
 * `--skipShutdown` - Skips the Jenkins shutdown logic to improve performance.
@@ -169,6 +184,32 @@ Advanced arguments:
 * `--waitOnExit` - Keep Jenkinsfile Runner running upon job completion without various sleep() hacks in the Pipeline.
 * `--agentPort` - Port for connecting inbound Jenkins agents (over JNLP or WebSockets).
   Disabled by default.
+
+==== Mirror and offline resolution
+
+The Jenkins WAR, plugins and the latest LTS version number are downloaded from `updates.jenkins.io`
+and cached under `~/.jenkinsfile-runner/`. The exact layout is:
+
+....
+war/latest.txt
+war/<version>/jenkins-war-<version>.war
+plugins/<name>/<name>-<version>.hpi
+....
+
+`--mirror` rewrites the base address for both the WAR and the plugins; the WAR path is
+`<mirror>/war/<version>/jenkins.war` and the plugin path is
+`<mirror>/plugins/<name>/<version>/<name>.hpi`.
+`stable/latestCore.txt` is only rewritten when `--mirrorCore` is given explicitly.
+
+For an air-gapped environment, populate the cache (or a `file:` mirror) with the files above and pass `--offline`.
+Offline resolution never contacts the network and reports every missing artifact — with its expected cache path —
+before installing any plugin. For example, with `war/2.440.3/jenkins-war-2.440.3.war` and
+`plugins/git/git-5.2.0.hpi` cached, requesting `git:5.2.0` and `workflow-aggregator:latest` with `--offline`
+reports only the missing `plugins/workflow-aggregator/workflow-aggregator-latest.hpi`.
+
+NOTE: A `file:` mirror points at a local directory laid out as above. Building `file:` addresses is independent
+of downloading them, but actually fetching from one requires the WAR download to accept non-HTTP URLs; that
+download-side relaxation is included in the same change, so `file:` mirrors work end to end.
 
 
 ==== Running Jenkinsfiles (`run` command)
